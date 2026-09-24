@@ -1,0 +1,13 @@
+[Unit]
+Description=Cowrie log differences to Discord
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=monitor
+WorkingDirectory=/opt/cowrie-discord
+EnvironmentFile=/etc/cowrie-discord.env
+ExecStart=/home/monitor/.local/bin/uv run --offline --locked --project /opt/cowrie-discord /opt/cowrie-discord/cowrie_monitor.py --config /opt/cowrie-discord/config.json
+TimeoutStartSec=30min
+UMask=0077

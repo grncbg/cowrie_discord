@@ -1,0 +1,24 @@
+[project]
+name = "cowrie-discord"
+version = "0.1.0"
+description = "Notify Discord of changes in remote Cowrie logs"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.mypy]
+python_version = "3.10"
+files = ["."]
+strict = true
+disallow_any_expr = true
+disallow_any_explicit = true
+disallow_any_unimported = true
+disallow_any_decorated = true
+warn_unreachable = true
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+]

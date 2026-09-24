@@ -1,0 +1,37 @@
+{
+  "ssh": {
+    "host": "cowrie-host",
+    "executable": "ssh",
+    "timeout_seconds": 90
+  },
+  "state_file": "state/snapshots.json",
+  "log_file": "logs/monitor.log",
+  "webhook_env": "DISCORD_WEBHOOK_URL",
+  "notify_initial": false,
+  "checks": [
+    {
+      "name": "commands",
+      "mention_everyone": false,
+      "interval_seconds": 0,
+      "file": "/opt/cowrie/var/log/cowrie/audit.log",
+      "regex": "CMD.+$",
+      "notify_removed": false
+    },
+    {
+      "name": "uploads",
+      "mention_everyone": false,
+      "interval_seconds": 0,
+      "file": "/opt/cowrie/var/log/cowrie/audit.log",
+      "regex": "(Saved|SFTP).+$",
+      "notify_removed": false
+    },
+    {
+      "name": "source-addresses",
+      "mention_everyone": false,
+      "interval_seconds": 0,
+      "file": "/opt/cowrie/var/log/cowrie/audit.log",
+      "regex": "(?<=New connection: )[^:]+",
+      "notify_removed": false
+    }
+  ]
+}
