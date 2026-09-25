@@ -1,11 +1,10 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping
 import copy
 from email.message import Message
 import io
 import json
 import os
 from pathlib import Path
-import subprocess
 import tempfile
 import time
 import unittest
@@ -14,6 +13,18 @@ import urllib.error
 import urllib.request
 
 import cowrie_monitor as monitor
+
+
+def incremental_stub(fetch: Callable[[monitor.Config, monitor.Check], list[str]]) -> Callable[
+    [monitor.Config, str, monitor.Cursor | None], tuple[monitor.Cursor, bytes]
+]:
+    def read(config: monitor.Config, file: str, cursor: monitor.Cursor | None) -> tuple[monitor.Cursor, bytes]:
+        check = next(item for item in config.checks if item.file == file)
+        records = [{"eventid": check.event_ids[0], check.json_field: value}
+                   for value in fetch(config, check)]
+        data = "\n".join(json.dumps(record) for record in records).encode()
+        return monitor.Cursor("test", len(data), ""), data
+    return read
 
 
 class MonitorTests(unittest.TestCase):
@@ -31,7 +42,7 @@ class MonitorTests(unittest.TestCase):
         self.addCleanup(clock_patch.stop)
         self.config = monitor.Config(
             ssh=monitor.SSHConfig("cowrie-host"), state_file="state.json",
-            checks=[monitor.Check("commands", "/tmp/audit.log", "CMD.+$")],
+            checks=[monitor.Check("commands", "/tmp/cowrie.json", "input", ("command",))],
         )
 
     def snapshot(self) -> monitor.State:
@@ -53,19 +64,19 @@ class MonitorTests(unittest.TestCase):
                 raise send_error
 
         environment = dict(os.environ, DISCORD_WEBHOOK_URL="https://example.invalid/secret")
-        with patch.object(monitor, "fetch", new=fetch), \
+        with patch.object(monitor, "fetch_increment", new=incremental_stub(fetch)), \
                 patch.object(monitor, "send_discord", new=send), \
                 patch.object(os, "environ", new=environment):
             result = monitor.run(self.config, self.base, dry_run)
         return result, sent
 
-    def test_baseline_unchanged_added_removed(self) -> None:
+    def test_baseline_unchanged_and_added(self) -> None:
         self.assertEqual(self.execute(["CMD a"])[1], list[str]())
         self.assertEqual(self.execute(["CMD a"])[1], list[str]())
         result, sent = self.execute(["CMD b"])
         self.assertEqual(result, 0)
         self.assertIn("+ CMD b", sent[0])
-        self.assertIn("- CMD a", sent[0])
+        self.assertNotIn("- CMD a", sent[0])
 
     def test_failed_delivery_preserves_snapshot_and_retries(self) -> None:
         self.execute(["CMD a"])
@@ -80,30 +91,30 @@ class MonitorTests(unittest.TestCase):
         self.now += 300
 
         def fetch(config: monitor.Config, check: monitor.Check) -> list[str]:
-            raise RuntimeError("grep failed")
+            raise RuntimeError("read failed")
 
-        with patch.object(monitor, "fetch", new=fetch):
+        with patch.object(monitor, "fetch_increment", new=incremental_stub(fetch)):
             self.assertEqual(monitor.run(self.config, self.base), 1)
         self.assertEqual(self.snapshot().checks, previous.checks)
 
-    def test_initial_notification_and_removed_option(self) -> None:
+    def test_initial_notification_and_cumulative_values(self) -> None:
         self.config.notify_initial = True
         self.assertEqual(len(self.execute(["CMD a"])[1]), 1)
-        self.config.checks[0].notify_removed = False
         self.assertEqual(self.execute([])[1], list[str]())
-        self.assertEqual(self.snapshot().checks["commands"].values, list[str]())
+        self.assertEqual(self.snapshot().checks["commands"].values, list[str](["CMD a"]))
 
     def test_source_change_rebaselines_and_dry_run_does_not_update(self) -> None:
         self.execute(["CMD a"])
         previous = self.snapshot()
         self.execute(["CMD b"], dry_run=True)
         self.assertEqual(self.snapshot(), previous)
-        self.config.checks[0].regex = "Saved.+$"
+        self.config.checks[0].json_field = "message"
         self.assertEqual(self.execute(["Saved file"])[1], list[str]())
 
     def test_independent_checks_continue_after_failure(self) -> None:
         second = copy.deepcopy(self.config.checks[0])
         second.name = "second"
+        second.file = "/tmp/second.json"
         self.config.checks.append(second)
 
         def fetch(config: monitor.Config, check: monitor.Check) -> list[str]:
@@ -111,32 +122,79 @@ class MonitorTests(unittest.TestCase):
                 raise RuntimeError("fail")
             return ["CMD b"]
 
-        with patch.object(monitor, "fetch", new=fetch):
+        with patch.object(monitor, "fetch_increment", new=incremental_stub(fetch)):
             self.assertEqual(monitor.run(self.config, self.base), 1)
         self.assertNotIn("commands", self.snapshot().checks)
         self.assertIn("second", self.snapshot().checks)
 
-    def test_grep_exit_codes_and_unique_values(self) -> None:
-        result = subprocess.CompletedProcess[bytes](list[str](), 0, b"CMD b\nCMD a\nCMD a\n", b"")
+    def test_json_credentials_preserve_special_values(self) -> None:
+        config = monitor.load_config(Path(__file__).with_name("config.example.json"))
+        cases = [("user/name", ""), ("", " spaced "), ("日本語", '[]/"\\\n\x00')]
+        records: list[dict[str, object]] = [
+            {"eventid": event, "username": user, "password": password}
+            for event in ("cowrie.login.failed", "cowrie.login.success")
+            for user, password in cases
+        ]
+        records.append({"eventid": "cowrie.command.input"})
+        data = ("\n".join(json.dumps(record) for record in records) + "\n").encode()
+        for name, index in (("user", 0), ("password", 1)):
+            check = next(c for c in config.checks if c.name == name)
+            expected: list[str] = sorted({c[index] for c in cases})
+            self.assertEqual(monitor.json_log_values(data, check.json_field, check.event_ids), expected)
 
-        def run(
-            args: Sequence[str], *, stdin: int, stdout: int, stderr: int,
-            timeout: float, check: bool,
-        ) -> subprocess.CompletedProcess[bytes]:
-            self.assertIn("BatchMode=yes", args)
-            return result
+    def test_json_invalid_records_fail(self) -> None:
+        invalid = [b'{', b'[]', b'{}', b'{"eventid":3}',
+                   b'{"eventid":"auth"}', b'{"eventid":"auth","password":null}',
+                   b'{"eventid":"auth","password":42}', b'\xff']
+        for data in invalid:
+            with self.subTest(data=data), self.assertRaises(RuntimeError):
+                monitor.json_log_values(data, "password", ("auth",))
 
-        with patch.object(subprocess, "run", new=run):
-            expected: list[str] = ["CMD a", "CMD b"]
-            self.assertEqual(monitor.fetch(self.config, self.config.checks[0]), expected)
-            result = subprocess.CompletedProcess[bytes](list[str](), 1, b"", b"")
-            self.assertEqual(monitor.fetch(self.config, self.config.checks[0]), list[str]())
-            result = subprocess.CompletedProcess[bytes](list[str](), 2, b"", b"Permission denied")
-            with self.assertRaises(RuntimeError):
-                monitor.fetch(self.config, self.config.checks[0])
+    def test_example_event_selection_for_commands_files_and_addresses(self) -> None:
+        config = monitor.load_config(Path(__file__).with_name("config.example.json"))
+        records: list[dict[str, str]] = [
+            {"eventid": "cowrie.command.input", "input": "echo Saved /tmp/x"},
+            {"eventid": "cowrie.command.failed", "input": "ignored"},
+            {"eventid": "cowrie.session.file_download", "message": "download complete"},
+            {"eventid": "cowrie.session.file_upload", "message": "upload complete"},
+            {"eventid": "cowrie.session.file_download.failed", "message": "ignored"},
+            {"eventid": "cowrie.session.connect", "src_ip": "2001:db8::1"},
+            {"eventid": "cowrie.session.connect", "src_ip": "192.0.2.1"},
+            {"eventid": "cowrie.client.version", "src_ip": "192.0.2.2",
+             "message": "CMD spoof Saved SFTP New connection: 192.0.2.2"},
+        ]
+        data = "\n".join(json.dumps(record) for record in records + records).encode()
+        expected: dict[str, list[str]] = {
+            "commands": ["echo Saved /tmp/x"],
+            "uploads": ["download complete", "upload complete"],
+            "source-addresses": ["192.0.2.1", "2001:db8::1"],
+        }
+        for check in config.checks:
+            self.assertEqual(check.file, "/opt/cowrie/var/log/cowrie/cowrie.json")
+            if check.name in expected:
+                field = check.json_field
+                self.assertEqual(monitor.json_log_values(data, field, check.event_ids),
+                                 expected[check.name])
+
+    def test_json_fingerprint_rebaselines(self) -> None:
+        self.execute(["old"])
+        check = self.config.checks[0]
+        original = monitor.fingerprint(self.config, check)
+        check.json_field = "username"
+        check.event_ids = ("failed", "success")
+        signature = monitor.fingerprint(self.config, check)
+        self.assertNotEqual(original, signature)
+        self.assertEqual(self.execute(["new"])[1], list[str]())
+        check.event_ids = ("success", "failed", "success")
+        self.assertEqual(signature, monitor.fingerprint(self.config, check))
+        check.json_field = "password"
+        self.assertNotEqual(signature, monitor.fingerprint(self.config, check))
+        check.json_field = "username"
+        check.event_ids = ("success",)
+        self.assertNotEqual(signature, monitor.fingerprint(self.config, check))
 
     def test_long_messages_and_mentions(self) -> None:
-        chunks = list(monitor.messages("😀" * 120, ["😀" * 3000 + "``` @everyone"], []))
+        chunks = list(monitor.messages("😀" * 120, ["😀" * 3000 + "``` @everyone"]))
         self.assertGreater(len(chunks), 1)
         for chunk in chunks:
             self.assertLessEqual(len(chunk.encode("utf-16-le")) // 2, 2000)
@@ -205,7 +263,7 @@ class MonitorTests(unittest.TestCase):
 
     def test_only_selected_check_mentions_and_only_first_chunk(self) -> None:
         self.config.checks[0].mention_everyone = True
-        self.config.checks.append(monitor.Check("quiet", "/tmp/audit.log", "CMD.+$"))
+        self.config.checks.append(monitor.Check("quiet", "/tmp/cowrie.json", "input", ("command",)))
         self.execute(["CMD a"])
         sent: list[tuple[str, bool]] = []
 
@@ -217,7 +275,7 @@ class MonitorTests(unittest.TestCase):
 
         self.now += 300
         environment = dict(os.environ, DISCORD_WEBHOOK_URL="https://example.invalid/webhook")
-        with patch.object(monitor, "fetch", new=fetch), \
+        with patch.object(monitor, "fetch_increment", new=incremental_stub(fetch)), \
                 patch.object(monitor, "send_discord", new=send), \
                 patch.object(os, "environ", new=environment):
             self.assertEqual(monitor.run(self.config, self.base), 0)
@@ -233,7 +291,7 @@ class MonitorTests(unittest.TestCase):
 
         with monitor.state_lock(self.base / "state.json.lock") as acquired:
             self.assertTrue(acquired)
-            with patch.object(monitor, "fetch", new=fetch):
+            with patch.object(monitor, "fetch_increment", new=incremental_stub(fetch)):
                 self.assertEqual(monitor.run(self.config, self.base), 0)
 
     def test_corrupt_state_is_not_overwritten(self) -> None:
@@ -248,18 +306,24 @@ class MonitorTests(unittest.TestCase):
 
     def test_config_validation_and_defaults(self) -> None:
         path = self.base / "config.json"
-        check: dict[str, object] = {"name": "test", "file": "/tmp/audit.log", "regex": "CMD.+$"}
+        check: dict[str, object] = {"name": "test", "file": "/tmp/cowrie.json", "json_field": "input", "event_ids": ["command"]}
         ssh: dict[str, object] = {"host": "cowrie-host"}
         config: dict[str, object] = {"ssh": ssh, "checks": [check]}
         path.write_text(json.dumps(config), encoding="utf-8")
         loaded = monitor.load_config(path)
         self.assertEqual(loaded.ssh.timeout_seconds, 90)
-        self.assertTrue(loaded.checks[0].notify_removed)
         self.assertFalse(loaded.notify_initial)
         self.assertFalse(loaded.checks[0].mention_everyone)
         self.assertEqual(loaded.checks[0].interval_seconds, 300)
+        json_check: dict[str, object] = {
+            "name": "password", "file": "/tmp/cowrie.json",
+            "json_field": "password", "event_ids": ["cowrie.login.failed"],
+        }
         invalid: list[Mapping[str, object]] = [
-            {"checks": [dict(check, notify_removed="true")]},
+            *({"checks": [dict(json_check, event_ids=value)]}
+              for value in (None, [], "auth", [1], [""])),
+            *({"checks": [dict(json_check, json_field=value)]}
+              for value in (None, "", 1)),
             {"checks": [dict(check, mention_everyone="true")]},
             {"checks": [dict(check, mention_everyone=1)]},
             {"ssh": dict(ssh, timeout_seconds=True)},
@@ -291,7 +355,7 @@ class MonitorTests(unittest.TestCase):
         path.write_text(
             '{"ssh":{"host":"cowrie-host"},"state_file":"state.json",'
             '"checks":[{"name":"commands","file":"/tmp/audit.log",'
-            '"regex":"CMD.+$","interval_seconds":0}]}', encoding="utf-8",
+            '"json_field":"input","event_ids":["command"],"interval_seconds":0}]}', encoding="utf-8",
         )
         self.config = monitor.load_config(path)
         self.assertEqual(self.config.checks[0].interval_seconds, 0)
@@ -302,7 +366,7 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("+ CMD d", self.execute(["CMD d"], advance_seconds=0)[1][0])
 
     def test_interval_boundary_and_independent_checks(self) -> None:
-        self.config.checks.append(monitor.Check("slow", "/tmp/audit.log", "CMD.+$", interval_seconds=900))
+        self.config.checks.append(monitor.Check("slow", "/tmp/slow.json", "input", ("command",), interval_seconds=900))
         self.execute(["CMD a"], advance_seconds=0)
         previous = self.snapshot()
         seen: list[str] = []
@@ -311,7 +375,7 @@ class MonitorTests(unittest.TestCase):
             seen.append(check.name)
             return ["CMD a"]
 
-        with patch.object(monitor, "fetch", new=fetch):
+        with patch.object(monitor, "fetch_increment", new=incremental_stub(fetch)):
             self.now += 299
             self.assertEqual(monitor.run(self.config, self.base), 0)
             self.assertEqual(len(seen), 0)
@@ -339,7 +403,7 @@ class MonitorTests(unittest.TestCase):
             calls.append(check.name)
             raise RuntimeError("offline")
 
-        with patch.object(monitor, "fetch", new=fetch):
+        with patch.object(monitor, "fetch_increment", new=incremental_stub(fetch)):
             self.assertEqual(monitor.run(self.config, self.base), 1)
             self.assertEqual(monitor.run(self.config, self.base), 0)
         self.assertEqual(len(calls), 1)
@@ -353,14 +417,14 @@ class MonitorTests(unittest.TestCase):
         path.write_text(json.dumps(raw), encoding="utf-8")
         sent = self.execute(["CMD b"], advance_seconds=0)[1]
         self.assertIn("+ CMD b", sent[0])
-        self.assertIn("- CMD a", sent[0])
+        self.assertNotIn("- CMD a", sent[0])
 
     def test_interval_source_changes_and_clock_rollback(self) -> None:
         self.config.checks[0].interval_seconds = 900
         self.execute(["CMD a"], advance_seconds=0)
         self.config.checks[0].interval_seconds = 300
         self.assertEqual(len(self.execute(["CMD b"], advance_seconds=300)[1]), 1)
-        self.config.checks[0].regex = "Saved.+$"
+        self.config.checks[0].json_field = "message"
         self.execute(["Saved a"], advance_seconds=0)
         self.assertEqual(self.snapshot().checks["commands"].values, list[str](["Saved a"]))
         self.assertEqual(len(self.execute(["Saved b"], advance_seconds=-100)[1]), 1)

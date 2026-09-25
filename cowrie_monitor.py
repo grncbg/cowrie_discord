@@ -1,6 +1,8 @@
-"""Compare remote grep results and notify Discord. Python 3.10+, stdlib only."""
+"""Read incremental Cowrie JSON events and notify Discord. Python 3.10+, stdlib only."""
+from __future__ import annotations
 
 import argparse
+import base64
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -39,8 +41,8 @@ class SSHConfig:
 class Check:
     name: str
     file: str
-    regex: str
-    notify_removed: bool = True
+    json_field: str
+    event_ids: tuple[str, ...]
     interval_seconds: int = 300
     mention_everyone: bool = False
 
@@ -72,6 +74,15 @@ class State:
     version: int = 1
     checks: dict[str, Snapshot] = field(default_factory=dict)
     last_runs: dict[str, LastRun] = field(default_factory=dict)
+    streams: dict[str, Cursor] = field(default_factory=dict)
+    observed: dict[str, Snapshot] = field(default_factory=dict)
+
+
+@dataclass
+class Cursor:
+    identity: str
+    offset: int
+    anchor: str
 
 
 def is_mapping(value: object) -> TypeGuard[Mapping[object, object]]:
@@ -157,11 +168,13 @@ def load_config(path: Path) -> Config:
         item = json_object(raw_check)
         check = Check(
             name=nonempty_string(item["name"]), file=nonempty_string(item["file"]),
-            regex=nonempty_string(item["regex"]),
-            notify_removed=boolean(item.get("notify_removed", True)),
+            json_field=nonempty_string(item["json_field"]),
+            event_ids=tuple(nonempty_string(value) for value in json_array(item["event_ids"])),
             interval_seconds=nonnegative_integer(item.get("interval_seconds", 300)),
             mention_everyone=boolean(item.get("mention_everyone", False)),
         )
+        if not check.event_ids:
+            raise ValueError("event_ids must not be empty")
         if len(check.name) > 120 or "\n" in check.name or "\r" in check.name:
             raise ValueError("check name must be a single line of at most 120 characters")
         if check.name in names:
@@ -200,7 +213,73 @@ def load_state(path: Path) -> State:
                 or not math.isfinite(started_at) or started_at < 0):
             raise ValueError("Invalid last run timestamp (not overwritten)")
         last_runs[name] = LastRun(string(entry["source"]), float(started_at))
-    return State(version, checks, last_runs)
+    streams: dict[str, Cursor] = {}
+    for key, value in json_object(raw.get("streams", {})).items():
+        entry = json_object(value)
+        streams[key] = Cursor(nonempty_string(entry["identity"]),
+                              nonnegative_integer(entry["offset"]), string(entry["anchor"]))
+    observed: dict[str, Snapshot] = {}
+    for key, value in json_object(raw.get("observed", {})).items():
+        entry = json_object(value)
+        observed[key] = Snapshot(string(entry["source"]),
+                                 [string(item) for item in json_array(entry["values"])])
+    return State(version, checks, last_runs, streams, observed)
+
+
+def fetch_increment(config: Config, file: str, cursor: Cursor | None) -> tuple[Cursor, bytes]:
+    reader = Path(__file__).with_name("incremental_reader.py").read_text(encoding="utf-8")
+    command = "python3 -c " + shlex.quote(reader) + " " + " ".join(shlex.quote(arg) for arg in (
+        file, cursor.identity if cursor else "", str(cursor.offset if cursor else 0),
+        cursor.anchor if cursor else "",
+    ))
+    result = subprocess.run(
+        [config.ssh.executable, "-T", "-o", "BatchMode=yes", "-o",
+         "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15", "-o",
+         "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2", config.ssh.host, command],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=config.ssh.timeout_seconds, check=False,
+    )
+    if result.returncode:
+        detail = repr(result.stderr.decode("utf-8", errors="replace")[-1000:])
+        raise RuntimeError(f"Incremental SSH read failed: {detail}")
+    response = json_object(parse_json(result.stdout))
+    updated = Cursor(nonempty_string(response["identity"]),
+                     nonnegative_integer(response["offset"]), string(response["anchor"]))
+    for warning in json_array(response["warnings"]):
+        LOG.warning("%s", string(warning))
+    return updated, base64.b64decode(string(response["data"]), validate=True)
+
+
+def collect_increment(config: Config, check: Check, state: State) -> State:
+    related = [item for item in config.checks
+               if item.file == check.file]
+    signatures = sorted(fingerprint(config, item) for item in related)
+    source: list[str] = [config.ssh.host, check.file, *signatures]
+    key = hashlib.sha256(json.dumps(source).encode()).hexdigest()
+    previous_cursor = state.streams.get(key)
+    # Cursors are shared by extraction conditions, while baselines belong to names.
+    # A renamed check must read existing records before establishing its baseline.
+    for item in related:
+        signature = fingerprint(config, item)
+        snapshots = (state.observed.get(item.name), state.checks.get(item.name))
+        if not any(snapshot is not None and snapshot.source == signature
+                   for snapshot in snapshots):
+            previous_cursor = None
+            break
+    cursor, data = fetch_increment(config, check.file, previous_cursor)
+    observed = state.observed.copy()
+    for item in related:
+        field_name = item.json_field
+        signature = fingerprint(config, item)
+        previous = observed.get(item.name)
+        if previous is None or previous.source != signature:
+            previous = state.checks.get(item.name)
+        old = previous.values if previous is not None and previous.source == signature else []
+        values = sorted(set(old) | set(json_log_values(data, field_name, item.event_ids)))
+        observed[item.name] = Snapshot(signature, values)
+    streams = state.streams.copy()
+    streams[key] = cursor
+    return State(state.version, state.checks.copy(), state.last_runs.copy(), streams, observed)
 
 
 def seconds_until_due(check: Check, previous: LastRun | None, source: str, now: float) -> float:
@@ -256,35 +335,30 @@ def save_state(path: Path, state: State) -> None:
 
 
 def fingerprint(config: Config, check: Check) -> str:
-    source = [config.ssh.host, check.file, check.regex]
+    source = [config.ssh.host, check.file, "json", check.json_field, *sorted(set(check.event_ids))]
     return hashlib.sha256(json.dumps(source, ensure_ascii=True).encode()).hexdigest()
 
 
-def fetch(config: Config, check: Check) -> list[str]:
-    # GNU grep PCRE supports lookbehind. No shell on the local host.
-    # Do not pipe grep into sort: a pipeline would hide read/regex failures.
-    command = "LC_ALL=C grep -a -oP -e {} -- {}".format(
-        shlex.quote(check.regex), shlex.quote(check.file)
-    )
-    ssh = config.ssh
-    result = subprocess.run(
-        [ssh.executable, "-T", "-o", "BatchMode=yes", "-o",
-         "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15", "-o",
-         "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2", ssh.host, command],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        timeout=ssh.timeout_seconds, check=False,
-    )
-    if result.returncode not in (0, 1):
-        # stderr may contain terminal escapes or log data; quote and bound it.
-        detail = repr(result.stderr.decode("utf-8", errors="replace")[:1000])
-        raise RuntimeError(f"SSH/grep failed (exit {result.returncode}): {detail}")
-    # surrogateescape preserves distinct non-UTF8 bytes in the saved snapshot.
-    return sorted(set(result.stdout.decode("utf-8", errors="surrogateescape").split("\n")) - {""})
+def json_log_values(data: bytes, field_name: str, event_ids: Sequence[str]) -> list[str]:
+    """Decode JSONL without conflating escapes, empty values, or field boundaries."""
+    values: set[str] = set()
+    for number, line in enumerate(data.split(b"\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            record = json_object(parse_json(line.decode("utf-8")))
+            event_id = string(record.get("eventid"))
+            if event_id in event_ids:
+                values.add(string(record.get(field_name)))
+        except (ValueError, UnicodeError) as exc:
+            # Do not put raw log data/credentials in diagnostics; preserve the baseline.
+            raise RuntimeError(f"Invalid JSON log record at line {number}") from exc
+    return sorted(values)
 
 
-def messages(name: str, added: Sequence[str], removed: Sequence[str]) -> Iterator[str]:
+def messages(name: str, added: Sequence[str]) -> Iterator[str]:
     header = f"{name}\n"
-    text = "\n".join([*("+ " + line for line in added), *("- " + line for line in removed)])
+    text = "\n".join("+ " + line for line in added)
     # Render malformed bytes safely and prevent log content from closing code fences.
     text = text.encode("utf-8", errors="backslashreplace").decode("utf-8").replace("`", "ˋ")
     # 750 code points stay under 2000 UTF-16 units even with astral characters.
@@ -361,6 +435,7 @@ def run(config: Config, base: Path, dry_run: bool = False) -> int:
             return 0
         state = load_state(path)
         failed = False
+        collected: dict[str, Exception | None] = {}
         for check in config.checks:
             name = check.name
             try:
@@ -373,31 +448,43 @@ def run(config: Config, base: Path, dry_run: bool = False) -> int:
                 if not dry_run:
                     # Record attempts independently of successful notification snapshots.
                     # Persist before I/O so crashes and errors also respect the interval.
-                    candidate = State(state.version, state.checks.copy(), state.last_runs.copy())
+                    candidate = State(state.version, state.checks.copy(), state.last_runs.copy(),
+                                      state.streams.copy(), state.observed.copy())
                     candidate.last_runs[name] = LastRun(signature, started_at)
                     save_state(path, candidate)
                     state = candidate
-                current = fetch(config, check)
+                if check.file not in collected:
+                    try:
+                        candidate = collect_increment(config, check, state)
+                        if not dry_run:
+                            save_state(path, candidate)
+                        state = candidate
+                        collected[check.file] = None
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+                            subprocess.SubprocessError) as exc:
+                        collected[check.file] = exc
+                error = collected[check.file]
+                if error is not None:
+                    raise error
+                current = state.observed[name].values
                 previous = state.checks.get(name)
                 initial = previous is None or previous.source != signature
                 old: set[str] = set()
                 if previous is not None and not initial:
                     old = set(previous.values)
                 added = sorted(set(current) - old)
-                removed = sorted(old - set(current))
-                LOG.info("%s: %d unique, +%d -%d%s", name, len(current), len(added),
-                         len(removed), " (new baseline)" if initial else "")
+                LOG.info("%s: %d unique, +%d%s", name, len(current), len(added), " (new baseline)" if initial else "")
                 if dry_run:
                     continue
                 if not initial or config.notify_initial:
-                    notify_removed = removed if check.notify_removed else []
-                    if added or notify_removed:
+                    if added:
                         url = os.environ.get(config.webhook_env)
                         if not url:
                             raise RuntimeError("Webhook environment variable is not set")
-                        for index, content in enumerate(messages(name, added, notify_removed)):
+                        for index, content in enumerate(messages(name, added)):
                             send_discord(url, content, mention_everyone=check.mention_everyone and index == 0)
-                candidate = State(state.version, state.checks.copy(), state.last_runs.copy())
+                candidate = State(state.version, state.checks.copy(), state.last_runs.copy(),
+                                  state.streams.copy(), state.observed.copy())
                 candidate.checks[name] = Snapshot(signature, current)
                 save_state(path, candidate)
                 state = candidate

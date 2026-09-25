@@ -13,25 +13,54 @@
       "name": "commands",
       "mention_everyone": false,
       "interval_seconds": 0,
-      "file": "/opt/cowrie/var/log/cowrie/audit.log",
-      "regex": "CMD.+$",
-      "notify_removed": false
+      "file": "/opt/cowrie/var/log/cowrie/cowrie.json",
+      "json_field": "input",
+      "event_ids": [
+        "cowrie.command.input"
+      ]
     },
     {
       "name": "uploads",
       "mention_everyone": false,
       "interval_seconds": 0,
-      "file": "/opt/cowrie/var/log/cowrie/audit.log",
-      "regex": "(Saved|SFTP).+$",
-      "notify_removed": false
+      "file": "/opt/cowrie/var/log/cowrie/cowrie.json",
+      "json_field": "message",
+      "event_ids": [
+        "cowrie.session.file_download",
+        "cowrie.session.file_upload"
+      ]
+    },
+    {
+      "name": "user",
+      "mention_everyone": false,
+      "interval_seconds": 0,
+      "file": "/opt/cowrie/var/log/cowrie/cowrie.json",
+      "json_field": "username",
+      "event_ids": [
+        "cowrie.login.failed",
+        "cowrie.login.success"
+      ]
+    },
+    {
+      "name": "password",
+      "mention_everyone": false,
+      "interval_seconds": 0,
+      "file": "/opt/cowrie/var/log/cowrie/cowrie.json",
+      "json_field": "password",
+      "event_ids": [
+        "cowrie.login.failed",
+        "cowrie.login.success"
+      ]
     },
     {
       "name": "source-addresses",
       "mention_everyone": false,
       "interval_seconds": 0,
-      "file": "/opt/cowrie/var/log/cowrie/audit.log",
-      "regex": "(?<=New connection: )[^:]+",
-      "notify_removed": false
+      "file": "/opt/cowrie/var/log/cowrie/cowrie.json",
+      "json_field": "src_ip",
+      "event_ids": [
+        "cowrie.session.connect"
+      ]
     }
   ]
 }
