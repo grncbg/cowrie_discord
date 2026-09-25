@@ -170,7 +170,7 @@ SSHの独自ポート・鍵等はSSH configに記載し、必要なら `ssh.exec
 
 新規導入時はプロジェクト内で `test -e config.json || cp config.example.json config.json` を実行し、設定を編集してください。
 
-`cowrie_monitor.py`・`incremental_reader.py`・設定・`pyproject.toml`・`uv.lock` を `/opt/cowrie-discord/` に配置し、実行ユーザーがプロジェクト内の仮想環境・ログ・状態ディレクトリを書けるようにします。
+`cowrie_monitor.py`・`cowrie/` ディレクトリ全体・`incremental_reader.py`・設定・`pyproject.toml`・`uv.lock` を `/opt/cowrie-discord/` に配置し、実行ユーザーがプロジェクト内の仮想環境・ログ・状態ディレクトリを書けるようにします。
 uvを導入し、実行ユーザーで `uv sync --locked --project /opt/cowrie-discord` を一度実行してください。Windowsの `.venv` はコピーせずLinuxで作り直します。
 そのユーザーの `~/.ssh/config` に `cowrie-host` を設定し、対話なしのSSH接続を確認してください。
 `deploy/cowrie-discord.service` の `User=monitor` は実際のユーザーに置き換えます。
@@ -191,6 +191,26 @@ journalctl -u cowrie-discord.service
 ```
 
 timerは5分境界で実行し、停止中の分は起動後に1回実行します。WindowsとLinuxで同時に動かすと、それぞれから通知されるため移行時は旧タスクを停止してください。
+
+## コードの構成
+
+| ファイル | 責務 |
+| --- | --- |
+| `cowrie_monitor.py` | CLI、実行間隔の判定、取得・通知・保存の実行順序 |
+| `cowrie/models.py` | 設定・状態のデータ型、更新候補用の状態コピー |
+| `cowrie/validation.py` | 外部JSONの実行時型検証 |
+| `cowrie/configuration.py` | 設定の読込み、チェック項目の検証、相対パス解決 |
+| `cowrie/storage.py` | 状態の復元、原子的保存、OSロック |
+| `cowrie/events.py` | 抽出条件の識別、JSONL抽出、同じファイルの観測値集約 |
+| `cowrie/remote.py` | SSHコマンドの構築、取得結果の検証 |
+| `cowrie/discord.py` | 通知の分割・メンション制御、HTTP送信・再試行 |
+| `incremental_reader.py` | リモートで単体実行するローテーション探索・差分読取り |
+
+状態は「実行開始時刻」「読取り位置と観測値」「通知成功後の比較用データ」の順で保存します。更新候補を保存してから実行中の状態に採用し、失敗した保存で読取り位置や比較用データを進めない構造にしています。
+
+起動コマンドと状態ファイル形式は従来どおりです。Pythonコードから使われていた名前は `cowrie_monitor` でも再公開しています。新しいコードは各責務のモジュールから直接importしてください。テストで外部通信を差し替える場合は、参照元の `cowrie.remote.fetch_increment`、`cowrie.discord.post_discord` を差し替えます。
+
+テストは設定、ログ抽出、状態保存、SSH境界、Discord、差分読取り、実行全体に分割しています。`deploy/` はOS側の起動設定を担当します。
 
 ## テスト
 

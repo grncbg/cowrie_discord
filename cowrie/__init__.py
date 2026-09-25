@@ -1,0 +1,1 @@
+"""Cowrie monitoring components."""

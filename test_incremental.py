@@ -6,10 +6,26 @@ import unittest
 from unittest.mock import patch
 
 import cowrie_monitor as monitor
+from cowrie import remote
 from incremental_reader import read_increment
 
 
 class IncrementalTests(unittest.TestCase):
+    def test_incomplete_rotated_line_is_not_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cowrie.json"
+            path.write_bytes(b"complete\npartial")
+            identity, offset, anchor, _, _ = read_increment(path, "", 0, "")
+            rotated = path.with_name("cowrie.json.1")
+            path.rename(rotated)
+            path.write_bytes(b"new\n")
+            with self.assertRaisesRegex(RuntimeError, "incomplete final line"):
+                read_increment(path, identity, offset, anchor)
+            with rotated.open("ab") as stream:
+                stream.write(b"\n")
+            _, _, _, data, _ = read_increment(path, identity, offset, anchor)
+            self.assertEqual(data, b"partial\nnew\n")
+
     def test_renamed_check_rebuilds_baseline(self) -> None:
         for notify_initial in (False, True):
             with self.subTest(notify_initial=notify_initial), tempfile.TemporaryDirectory() as directory:
@@ -35,7 +51,7 @@ class IncrementalTests(unittest.TestCase):
                     sent.append(content)
 
                 environment: dict[str, str] = {"DISCORD_WEBHOOK_URL": "https://example.invalid"}
-                with patch.object(monitor, "fetch_increment", new=fetch), \
+                with patch.object(remote, "fetch_increment", new=fetch), \
                         patch.object(monitor, "send_discord", new=send), \
                         patch.dict(os.environ, environment):
                     self.assertEqual(monitor.run(config, base), 0)
@@ -135,7 +151,7 @@ class IncrementalTests(unittest.TestCase):
                     stream.write((json.dumps(record) + "\n").encode())
 
             environment: dict[str, str] = {"DISCORD_WEBHOOK_URL": "https://example.invalid"}
-            with patch.object(monitor, "fetch_increment", new=fetch), \
+            with patch.object(remote, "fetch_increment", new=fetch), \
                     patch.object(monitor, "send_discord", new=send), \
                     patch.dict(os.environ, environment), \
                     patch("cowrie_monitor.time.time", return_value=1000):
